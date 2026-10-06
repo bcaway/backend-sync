@@ -145,8 +145,14 @@ Deno.serve(async (req) => {
     }
 
     const authorization = req.headers.get("Authorization");
+    const token = authorization ? authorization.replace(/^Bearer\s+/i, "").trim() : "";
+    const expectedSecret = (Deno.env.get("SYNC_SECRET") || "").trim();
+    const serviceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "").trim();
 
-    if (authorization !== `Bearer ${SYNC_SECRET}`) {
+    if (!token || (token !== expectedSecret && token !== serviceRoleKey)) {
+      console.error(
+        `Auth mismatch: received token length ${token.length}, expected secret length ${expectedSecret.length}, service role key length ${serviceRoleKey.length}`
+      );
       return jsonResponse(
         { error: "Unauthorized" },
         401,
