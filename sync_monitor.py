@@ -568,7 +568,8 @@ def main():
     args = parser.parse_args()
 
     # Load and validate settings
-    doc_url = os.environ.get("GOOGLE_DOC_URL", DEFAULT_DOC_URL).strip()
+    raw_doc_url = os.environ.get("GOOGLE_DOC_URL")
+    doc_url = raw_doc_url.strip() if raw_doc_url and raw_doc_url.strip() else DEFAULT_DOC_URL
     supabase_url = os.environ.get("SUPABASE_URL", "").strip()
     sync_secret = os.environ.get("SYNC_SECRET", "").strip()
     chrome_state = os.environ.get("CHROME_STATE_PATH", CHROME_STATE_PATH)
