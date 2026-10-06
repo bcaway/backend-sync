@@ -147,3 +147,23 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Playwright & Auth
+chrome_state.json
+debug_last_page.html
+debug_last_response.json
+.debug/
