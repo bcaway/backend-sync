@@ -1,0 +1,142 @@
+name: BCA Teacher Absence Sync
+
+on:
+  schedule:
+    # 1. Peak window trigger (Mon-Fri at 11:00 UTC / 7:00 AM EDT):
+    # Runs the continuous monitor loop every 60s from 11:00 UTC until 13:30 UTC.
+    - cron: '0 11 * * 1-5'
+
+    # 2. Off-peak periodic trigger (Every 10 minutes):
+    # Runs a single-shot check. Automatically skipped if within the peak window.
+    - cron: '*/10 * * * *'
+
+  # Manual trigger for ad-hoc syncs and testing from GitHub UI
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Execution mode'
+        required: true
+        default: 'auto'
+        type: choice
+        options:
+          - auto
+          - once
+          - continuous
+      force:
+        description: 'Force push to Supabase (bypass hash check)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: teacher-sync-engine
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync Absences
+    runs-on: ubuntu-latest
+    # Generous timeout: Peak continuous run is 150 minutes (11:00-13:30 UTC).
+    # Hard cap is 165 minutes, well under GitHub's 360-minute limit.
+    timeout-minutes: 165
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Evaluate execution window
+        id: check_window
+        run: |
+          NOW_UTC_MINUTES=$(( 10#$(date -u +%H) * 60 + 10#$(date -u +%M) ))
+          DAY_OF_WEEK=$(date -u +%u) # 1=Mon .. 7=Sun
+          EVENT="${{ github.event_name }}"
+          INPUT_MODE="${{ inputs.mode }}"
+
+          echo "Current UTC time: $(date -u +%H:%M) (Day of week: $DAY_OF_WEEK)"
+
+          # Peak window: 11:00 UTC (660m) to 13:30 UTC (810m)
+          IS_PEAK=false
+          if [ "$DAY_OF_WEEK" -le 5 ] && [ "$NOW_UTC_MINUTES" -ge 660 ] && [ "$NOW_UTC_MINUTES" -lt 810 ]; then
+            IS_PEAK=true
+          fi
+
+          # If triggered by off-peak cron (*/10) while inside the peak window,
+          # skip setup because the 11:00 UTC peak worker is already running continuously.
+          if [ "$EVENT" = "schedule" ] && [ "$IS_PEAK" = "true" ] && [ "$NOW_UTC_MINUTES" -ge 665 ]; then
+            echo "Inside peak window (11:00-13:30 UTC). Peak continuous monitor is already active."
+            echo "Skipping off-peak single-shot run to conserve GitHub Actions minutes."
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_run=true" >> "$GITHUB_OUTPUT"
+          echo "is_peak=$IS_PEAK" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        if: steps.check_window.outputs.should_run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        if: steps.check_window.outputs.should_run == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        if: steps.check_window.outputs.should_run == 'true'
+        run: |
+          playwright install --with-deps chromium
+
+      - name: Restore Chrome session state from secrets
+        if: steps.check_window.outputs.should_run == 'true'
+        env:
+          CHROME_STATE_JSON: ${{ secrets.CHROME_STATE_JSON }}
+        run: |
+          if [ -z "$CHROME_STATE_JSON" ]; then
+            echo "::error::CHROME_STATE_JSON secret is empty or missing! Run capture_session.py locally and set repository secret."
+            exit 1
+          fi
+          printf '%s' "$CHROME_STATE_JSON" > chrome_state.json
+
+      - name: Run absence sync engine
+        if: steps.check_window.outputs.should_run == 'true'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SYNC_SECRET: ${{ secrets.SYNC_SECRET }}
+          GOOGLE_DOC_URL: ${{ secrets.GOOGLE_DOC_URL }}
+        run: |
+          # Build arguments
+          EXTRA_ARGS=""
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${{ inputs.mode }}" = "once" ]; then
+              EXTRA_ARGS="--once"
+            elif [ "${{ inputs.mode }}" = "continuous" ]; then
+              EXTRA_ARGS="--continuous --interval 60"
+            fi
+            if [ "${{ inputs.force }}" = "true" ]; then
+              EXTRA_ARGS="$EXTRA_ARGS --force"
+            fi
+          elif [ "${{ steps.check_window.outputs.is_peak }}" = "true" ]; then
+            EXTRA_ARGS="--continuous --interval 60"
+          else
+            EXTRA_ARGS="--once"
+          fi
+
+          echo "Executing: python sync_monitor.py $EXTRA_ARGS"
+          python sync_monitor.py $EXTRA_ARGS
+
+      # Upload debug artifacts if auth fails or errors occur
+      - name: Upload debug artifacts
+        if: always() && steps.check_window.outputs.should_run == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts-${{ github.run_id }}
+          path: |
+            .debug/
+            debug_last_page.html
+            debug_last_response.json
+          if-no-files-found: ignore
+          retention-days: 5
