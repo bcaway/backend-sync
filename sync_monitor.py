@@ -168,8 +168,10 @@ def parse_header_date(text: str) -> Optional[str]:
     Extracts the absence date from document header text:
     Supports:
     - 'BCA Class Cancellation List ... October 6, 2026'
+    - 'October 5, 2026'
     - 'Tuesday, October 6, 2026'
     - '10/6/2026'
+    - Handles split digits like 'October 5, 2 026'
     Returns ISO date format 'YYYY-MM-DD' or None if not found.
     """
     clean_text = (
@@ -177,6 +179,8 @@ def parse_header_date(text: str) -> Optional[str]:
         .replace("\u2014", "-")
         .replace("\u00a0", " ")
     )
+    # Collapse accidental spaces between digits, e.g. '2 026' -> '2026'
+    clean_text = re.sub(r"(?<=\d)\s+(?=\d)", "", clean_text)
 
     # 1. Month Day, Year (e.g. October 6, 2026 or Oct 6, 2026)
     pattern_month_day = re.compile(
@@ -228,10 +232,23 @@ def parse_absences_from_html(html: str) -> Tuple[str, List[Dict[str, str]]]:
     Returns (date_str, absences_list).
     """
     soup = BeautifulSoup(html, "html.parser")
-    full_text = soup.get_text(separator=" ")
 
-    # 1. Parse date
-    date_str = parse_header_date(full_text)
+    # 1. Parse date by inspecting header paragraphs first (avoids span-boundary space splits)
+    date_str = None
+    for elem in soup.find_all(["p", "h1", "h2", "h3", "div"]):
+        elem_text = elem.get_text().strip()
+        if elem_text:
+            parsed = parse_header_date(elem_text)
+            if parsed:
+                date_str = parsed
+                log(f"Found document date from <{elem.name}>: {date_str} ('{elem_text}')", "INFO")
+                break
+
+    # Fallback to inspecting full text if not found in individual tags
+    if not date_str:
+        full_text = soup.get_text()
+        date_str = parse_header_date(full_text)
+
     if not date_str:
         today = get_today_in_new_york()
         log(f"Header date not found in document text; defaulting to today ET ({today})", "WARN")
