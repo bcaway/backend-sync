@@ -83,6 +83,10 @@ python3 capture_session.py
 3. Once the document renders in the browser, return to your terminal and press **Enter**.
 4. The script will export your session to `chrome_state.json`.
 
+Deactivate the venv afterwards:
+```bash
+deactivate
+```
 ---
 
 ### Step 2: Configure GitHub Repository Secrets
