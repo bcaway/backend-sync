@@ -100,7 +100,7 @@ Add the following secrets:
 | :--- | :---: | :--- | :--- |
 | `CHROME_STATE_JSON` | **Yes** | Entire content of `chrome_state.json` exported in Step 1. | `{"cookies": [...], "origins": [...]}` |
 | `SUPABASE_URL` | **Yes** | Your Supabase project URL. | `https://xyzcompany.supabase.co` |
-| `SYNC_SECRET` | **Yes** | Bearer secret for `/functions/v1/sync-absences`. | Configured in Supabase Edge Functions. |
+| `SYNC_SECRET` | **Yes** | Bearer secret for `/functions/v1/sync-absences`. | Configured in Supabase Edge Functions. Created with: `openssl rand -base64 64`|
 | `GOOGLE_DOC_URL` | *Optional* | Published Google Doc URL. | Defaults to BCA's published cancellation doc if omitted. |
 
 ---
