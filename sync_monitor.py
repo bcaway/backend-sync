@@ -166,7 +166,10 @@ def normalize_periods(raw_value: Optional[str]) -> str:
 def parse_header_date(text: str) -> Optional[str]:
     """
     Extracts the absence date from document header text:
-    'BCA Class Cancellation List \n {Month} {Day}, {YYYY}'
+    Supports:
+    - 'BCA Class Cancellation List ... October 6, 2026'
+    - 'Tuesday, October 6, 2026'
+    - '10/6/2026'
     Returns ISO date format 'YYYY-MM-DD' or None if not found.
     """
     clean_text = (
@@ -175,33 +178,37 @@ def parse_header_date(text: str) -> Optional[str]:
         .replace("\u00a0", " ")
     )
 
-    # Primary header regex
-    header_pattern = re.compile(
-        r"BCA\s+Class\s+Cancellation\s+List[\s\S]*?([a-zA-Z]+)\s+(\d{1,2}),?\s+(\d{4})",
+    # 1. Month Day, Year (e.g. October 6, 2026 or Oct 6, 2026)
+    pattern_month_day = re.compile(
+        r"(?:(?:mon|tues?|wed(?:nes)?|thu(?:rs)?|fri(?:day)?|sat(?:urday)?|sun(?:day)?)[a-z]*,?\s+)?"
+        r"([a-zA-Z]+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})",
         re.IGNORECASE,
     )
-    match = header_pattern.search(clean_text)
+    m = pattern_month_day.search(clean_text)
+    if m:
+        month_raw = m.group(1).lower()
+        month_int = MONTH_NAME_TO_INT.get(month_raw)
+        if month_int:
+            try:
+                day_int = int(m.group(2))
+                year_int = int(m.group(3))
+                if 1 <= day_int <= 31 and 2020 <= year_int <= 2100:
+                    return f"{year_int:04d}-{month_int:02d}-{day_int:02d}"
+            except ValueError:
+                pass
 
-    # Fallback to Month Day, Year pattern
-    if not match:
-        fallback_pattern = re.compile(r"([a-zA-Z]+)\s+(\d{1,2}),?\s+(\d{4})", re.IGNORECASE)
-        match = fallback_pattern.search(clean_text)
-
-    if not match:
-        return None
-
-    month_raw = match.group(1).lower()
-    month_int = MONTH_NAME_TO_INT.get(month_raw)
-    if not month_int:
-        return None
-
-    try:
-        day_int = int(match.group(2))
-        year_int = int(match.group(3))
-        if 1 <= day_int <= 31 and 2020 <= year_int <= 2100:
-            return f"{year_int:04d}-{month_int:02d}-{day_int:02d}"
-    except ValueError:
-        return None
+    # 2. Numeric M/D/YYYY or MM/DD/YYYY
+    pattern_slash = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\b")
+    m_slash = pattern_slash.search(clean_text)
+    if m_slash:
+        try:
+            month_int = int(m_slash.group(1))
+            day_int = int(m_slash.group(2))
+            year_int = int(m_slash.group(3))
+            if 1 <= month_int <= 12 and 1 <= day_int <= 31 and 2020 <= year_int <= 2100:
+                return f"{year_int:04d}-{month_int:02d}-{day_int:02d}"
+        except ValueError:
+            pass
 
     return None
 
@@ -410,11 +417,15 @@ def push_to_supabase(
     Submits normalized absences payload to Supabase Edge Function 'sync-absences'.
     Returns (success, response_json).
     """
-    base_url = supabase_url.rstrip("/")
-    endpoint = f"{base_url}/functions/v1/sync-absences"
+    clean_secret = re.sub(r"[\r\n\t]+", "", sync_secret).strip()
+    if clean_secret.lower().startswith("bearer "):
+        clean_secret = clean_secret[7:].strip()
+
+    clean_url = re.sub(r"[\r\n\t]+", "", supabase_url).strip().rstrip("/")
+    endpoint = f"{clean_url}/functions/v1/sync-absences"
 
     headers = {
-        "Authorization": f"Bearer {sync_secret}",
+        "Authorization": f"Bearer {clean_secret}",
         "Content-Type": "application/json",
     }
     payload = {

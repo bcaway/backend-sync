@@ -29,8 +29,8 @@ on:
         type: boolean
 
 concurrency:
-  group: teacher-sync-engine
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event_name }}
+  cancel-in-progress: true
 
 jobs:
   sync:
