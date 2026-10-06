@@ -55,17 +55,26 @@ To achieve **true 1-minute resolution without hitting limits or burning runner m
 
 Because the official BCA Class Cancellation Google Doc is restricted to `@bergen.org` accounts, Playwright uses exported browser session cookies to bypass the Google login wall.
 
-Run the interactive session capture utility locally on your computer:
-
+Start a virtual Python Enviornment:
 ```bash
 # 1. Clone or navigate to the repository
 cd backend-sync
 
-# 2. Install dependencies
+# 2. Create a virtual enviornment
+python3 -m venv .venv
+
+# 3. Activate the virtual enviornment
+source .venv/bin/activate
+```
+
+Run the interactive session capture utility locally on your computer:
+
+```bash
+# 1. Install dependencies
 python3 -m pip install -r requirements.txt
 playwright install chromium
 
-# 3. Launch the session capture helper
+# 2. Launch the session capture helper
 python3 capture_session.py
 ```
 
