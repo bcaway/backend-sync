@@ -145,17 +145,16 @@ Deno.serve(async (req) => {
     }
 
     const authorization = req.headers.get("Authorization");
-    const token = authorization ? authorization.replace(/^Bearer\s+/i, "").trim() : "";
-    const rawSecret = (Deno.env.get("SYNC_SECRET") || "").trim();
-    const unquotedSecret = rawSecret.replace(/^["']+|["']+$/g, "").trim();
-    const serviceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "").trim();
+    const token = authorization ? authorization.replace(/^Bearer\s+/i, "").replace(/[\s\r\n\t]+/g, "") : "";
+    const rawSecret = (Deno.env.get("SYNC_SECRET") || "").replace(/[\s\r\n\t]+/g, "");
+    const unquotedSecret = rawSecret.replace(/^["']+|["']+$/g, "").replace(/[\s\r\n\t]+/g, "");
+    const serviceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "").replace(/[\s\r\n\t]+/g, "");
 
     const isAuthorized = Boolean(
       token && (
         token === rawSecret ||
         token === unquotedSecret ||
-        token === serviceRoleKey ||
-        (token.length >= 50 && (rawSecret.startsWith(token) || token.startsWith(rawSecret) || unquotedSecret.startsWith(token) || token.startsWith(unquotedSecret)))
+        token === serviceRoleKey
       )
     );
 
@@ -169,7 +168,10 @@ Deno.serve(async (req) => {
           debug: {
             token_len: token.length,
             raw_secret_len: rawSecret.length,
-            unquoted_secret_len: unquotedSecret.length,
+            token_prefix: token.slice(0, 4),
+            secret_prefix: rawSecret.slice(0, 4),
+            token_suffix: token.slice(-4),
+            secret_suffix: rawSecret.slice(-4),
           },
         },
         401,
