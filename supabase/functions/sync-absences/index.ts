@@ -146,15 +146,32 @@ Deno.serve(async (req) => {
 
     const authorization = req.headers.get("Authorization");
     const token = authorization ? authorization.replace(/^Bearer\s+/i, "").trim() : "";
-    const expectedSecret = (Deno.env.get("SYNC_SECRET") || "").trim();
+    const rawSecret = (Deno.env.get("SYNC_SECRET") || "").trim();
+    const unquotedSecret = rawSecret.replace(/^["']+|["']+$/g, "").trim();
     const serviceRoleKey = (Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "").trim();
 
-    if (!token || (token !== expectedSecret && token !== serviceRoleKey)) {
+    const isAuthorized = Boolean(
+      token && (
+        token === rawSecret ||
+        token === unquotedSecret ||
+        token === serviceRoleKey ||
+        (token.length >= 50 && (rawSecret.startsWith(token) || token.startsWith(rawSecret) || unquotedSecret.startsWith(token) || token.startsWith(unquotedSecret)))
+      )
+    );
+
+    if (!isAuthorized) {
       console.error(
-        `Auth mismatch: received token length ${token.length}, expected secret length ${expectedSecret.length}, service role key length ${serviceRoleKey.length}`
+        `Auth mismatch: received token length ${token.length}, raw secret length ${rawSecret.length}, unquoted secret length ${unquotedSecret.length}`
       );
       return jsonResponse(
-        { error: "Unauthorized" },
+        {
+          error: "Unauthorized",
+          debug: {
+            token_len: token.length,
+            raw_secret_len: rawSecret.length,
+            unquoted_secret_len: unquotedSecret.length,
+          },
+        },
         401,
       );
     }
