@@ -20,6 +20,9 @@ concurrency:
   group: teacher-sync-offpeak-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   sync:
     name: Sync Absences (Off-Peak)

@@ -22,6 +22,9 @@ concurrency:
   group: teacher-sync-peak-${{ github.ref }}
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
 jobs:
   sync:
     name: Sync Absences (Peak Continuous)
