@@ -33,10 +33,11 @@ jobs:
                 owner,
                 repo,
                 workflow_id: workflowId,
-                event: 'schedule',
                 per_page: 50,
               });
-              return response.data.workflow_runs || [];
+              return (response.data.workflow_runs || []).filter(
+                (run) => run.event === 'schedule' || run.event === 'workflow_dispatch'
+              );
             };
 
             const [offPeakRuns, peakRuns] = await Promise.all([

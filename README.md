@@ -1,7 +1,7 @@
 # backend-sync
 
 > **BCAway Backend Sync — Automated Teacher Absence Ingestion Engine**  
-> High-performance Python & GitHub Actions synchronization pipeline that monitors the BCA Class Cancellation Google Doc, parses attendance schedules to BCAway canonical standards, fingerprints changes with SHA-256 hashing, and updates Supabase in real-time.
+> High-performance Python, Cloudflare Workers, and GitHub Actions synchronization pipeline that monitors the BCA Class Cancellation Google Doc, parses attendance schedules to BCAway canonical standards, fingerprints changes with SHA-256 hashing, and updates Supabase in real-time.
 
 ---
 
@@ -9,137 +9,231 @@
 
 ```mermaid
 flowchart TD
-    Doc["BCA Class Cancellation Google Doc<br/>(Restricted @bergen.org Workspace)"]
-    Playwright["Headless Playwright Chromium<br/>(Authenticated via CHROME_STATE_JSON)"]
-    Parser["BCAway Parsing & Normalization Engine<br/>(sync_monitor.py)"]
-    Hasher["SHA-256 Fingerprinting Cache"]
-    EdgeFunction["Supabase Edge Function<br/>(POST /functions/v1/sync-absences)"]
-    DB[("Supabase DB<br/>(teacher_absences)")]
-    Worker["Cloudflare Worker<br/>(POST /notify-absence)"]
-    App["BCAway Mobile App<br/>(Realtime Subscription)"]
+    subgraph TriggerLayer ["1. Precision Trigger Layer (Cloudflare Workers)"]
+        CF["backend-cron-trigger<br/>(Cloudflare Worker)"]
+        CF_CRON["Cloudflare Cron Schedule<br/>(Every 10 min + 11:00 UTC Peak)"]
+        CF_CRON --> CF
+    end
 
-    Doc -->|"Scrapes DOM & Tables"| Playwright
-    Playwright --> Parser
-    Parser --> Hasher
-    Hasher -->|"Hash changed / First run"| EdgeFunction
-    Hasher -.->|"Identical hash"| Skip["Skip network call (No-op)"]
-    EdgeFunction -->|"Atomic Live Snapshot"| DB
-    EdgeFunction -->|"Diff Events (insert/update/delete)"| Worker
-    DB --> App
+    subgraph ExecutionLayer ["2. Execution Layer (GitHub Actions)"]
+        GH_API["GitHub Actions REST API<br/>(POST /dispatches)"]
+        PeakRunner["Peak Continuous Runner<br/>(11:00-13:30 UTC / 60s loop)"]
+        OffPeakRunner["Off-Peak Single-Shot Runner<br/>(Every 10 mins / ~20s run)"]
+
+        CF -->|"HTTP 204 via PAT"| GH_API
+        GH_API -->|"11:00 UTC Mon-Fri"| PeakRunner
+        GH_API -->|"Off-peak intervals"| OffPeakRunner
+    end
+
+    subgraph ScraperEngine ["3. Ingestion & Normalization Engine (Playwright)"]
+        Doc["BCA Class Cancellation Doc<br/>(Restricted @bergen.org Workspace)"]
+        Session["Authenticated Cookies<br/>(CHROME_STATE_JSON)"]
+        Playwright["Headless Chromium<br/>(sync_monitor.py)"]
+        Parser["BCAway Parser & Normalizer<br/>(Dates, Names, Periods)"]
+        Hasher["SHA-256 Content Fingerprinter"]
+
+        Session -.-> Playwright
+        Doc -->|"Extract DOM & Tables"| Playwright
+        PeakRunner --> Playwright
+        OffPeakRunner --> Playwright
+        Playwright --> Parser
+        Parser --> Hasher
+    end
+
+    subgraph PersistenceLayer ["4. Persistence & Notifications (Supabase & Edge)"]
+        EdgeFunction["Supabase Edge Function<br/>(POST /functions/v1/sync-absences)"]
+        DB[("Supabase DB<br/>teacher_absences & sync_metadata")]
+        NotifWorker["Notifications Worker<br/>(POST /notify-absence)"]
+        App["BCAway Mobile App<br/>(Realtime Subscriptions)"]
+
+        Hasher -->|"Hash changed / First run"| EdgeFunction
+        Hasher -.->|"Identical hash"| Skip["Skip network sync (No-op)"]
+        EdgeFunction -->|"Atomic Transaction"| DB
+        EdgeFunction -->|"Diff Events (insert/delete)"| NotifWorker
+        DB --> App
+    end
 ```
 
 ---
 
-## ⚡ Scheduling Strategy & GitHub Actions Optimization
+## ⚡ Precision Scheduling Strategy
 
-GitHub Actions has a 5-minute minimum cron resolution and VM boot overhead (30–60s per runner). Spawning 150 separate VMs across the morning rush would quickly exhaust GitHub Actions quota.
+GitHub Actions native cron schedules (`schedule: [cron: ...]`) are shared globally across GitHub, frequently suffering from significant queuing delays (15–90+ minutes) or missed triggers during high-traffic hours.
 
-To achieve **true 1-minute peak resolution** while keeping off-peak jobs lightweight, scheduling is split across separate workflows:
+To solve this, **BCAway separates scheduling from execution**:
+1. **Precision Triggering (`backend-cron-trigger`):** A lightweight Cloudflare Worker running on Cloudflare's global edge network fires every 10 minutes with sub-second precision, dispatching GitHub Actions workflows via the GitHub REST API.
+2. **Execution (`backend-sync`):** GitHub Actions Ubuntu runners execute the authenticated Playwright scraper.
 
-### 1. Morning Peak Workflow (`teacher_sync_peak.yml`)
-* **Local School Time:** 7:00 AM – 9:30 AM EDT *(or 6:00 AM – 8:30 AM EST)*.
-* **Schedule:** Starts once at **11:00 UTC** on weekdays (`cron: '0 11 * * 1-5'`).
-* **Execution:** Runs `sync_monitor.py --continuous --interval 60`.
-* **Stop Condition:** The monitor exits when UTC reaches **13:30**.
-* **Concurrency:** Isolated to a peak-specific group so off-peak runs do not cancel it.
+### Schedule Rules Matrix
 
-### 2. Off-Peak Workflow (`teacher_sync_offpeak.yml`)
-* **Schedule:** Every **10 minutes** outside the weekday peak window, and every 10 minutes all weekend.
-* **Execution:** Always runs single-shot mode (`sync_monitor.py --once`).
-* **Runtime:** Designed to finish quickly (~seconds) and terminate.
-* **Concurrency:** Uses its own off-peak group so it cannot interfere with peak continuous runs.
-
-### 3. Health Check Workflow (`teacher_sync_healthcheck.yml`)
-* Runs every 30 minutes and inspects recent scheduled workflow history.
-* Fails with an explicit alert when expected cadence is missing (e.g., no active peak run during peak, or missing recent off-peak runs).
-
-> If exact minute-by-minute timing is business-critical, use an external scheduler (serverless cron / hosted scheduler) to trigger `workflow_dispatch` and use GitHub Actions as the execution layer.
+| Time Window (UTC) | Time Window (EDT) | Days | Trigger Mechanism | Target Workflow | Execution Behavior |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **11:00 AM** | 7:00 AM | Mon – Fri | Cloudflare Cron | `teacher_sync_peak.yml` | **Peak Continuous Loop:** Launches a single 150-minute runner that scrapes and syncs every 60 seconds until 13:30 UTC. |
+| **11:10 AM – 1:20 PM** | 7:10 AM – 9:20 AM | Mon – Fri | Cloudflare Cron | *None (Skipped)* | **Intelligent No-Op:** Cloudflare detects the continuous peak loop is actively running and skips redundant off-peak dispatches. |
+| **1:30 PM – 10:50 AM** | 9:30 AM – 6:50 AM | Mon – Fri | Cloudflare Cron | `teacher_sync_offpeak.yml` | **Off-Peak Periodic:** Dispatches a fast, single-shot sync cycle every 10 minutes. |
+| **All Day** | All Day | Sat – Sun | Cloudflare Cron | `teacher_sync_offpeak.yml` | **Weekend Periodic:** Dispatches a single-shot sync cycle every 10 minutes. |
 
 ---
 
-## 🚀 Setup & Deployment Guide
+## 📋 Master Implementation & Deployment Checklist
+
+Follow this checklist from top to bottom to configure and deploy the entire backend ingestion pipeline:
+
+```text
+[ ] Step 1: Capture Google Workspace Session Cookies
+[ ] Step 2: Deploy & Configure Supabase Edge Function
+[ ] Step 3: Configure GitHub Repository Secrets
+[ ] Step 4: Generate GitHub Personal Access Token (PAT)
+[ ] Step 5: Deploy backend-cron-trigger Cloudflare Worker
+[ ] Step 6: Verify End-to-End Pipeline
+```
+
+---
 
 ### Step 1: Capture Google Workspace Session Cookies
 
-Because the official BCA Class Cancellation Google Doc is restricted to `@bergen.org` accounts, Playwright uses exported browser session cookies to bypass the Google login wall.
+Because the BCA Class Cancellation Google Doc is restricted to `@bergen.org` accounts, Playwright uses exported browser cookies to bypass Google login:
 
-Start a virtual Python Enviornment:
-```bash
-# 1. Clone or navigate to the repository
-cd backend-sync
+1. Navigate to the `backend-sync` directory:
+   ```bash
+   cd backend-sync
+   python3 -m venv .venv
+   source .venv/bin/activate
+   pip install -r requirements.txt
+   playwright install chromium
+   ```
+2. Launch the session capture utility:
+   ```bash
+   python3 capture_session.py
+   ```
+3. A Chromium browser will open. Sign in with your authorized `@bergen.org` Google Workspace account and complete any 2FA prompts.
+4. Once the document renders in the browser, press **Enter** in your terminal.
+5. The script will save your active session state to `chrome_state.json`.
 
-# 2. Create a virtual enviornment
-python3 -m venv .venv
-
-# 3. Activate the virtual enviornment
-source .venv/bin/activate
-```
-
-Run the interactive session capture utility locally on your computer:
-
-```bash
-# 1. Install dependencies
-python3 -m pip install -r requirements.txt
-playwright install chromium
-
-# 2. Launch the session capture helper
-python3 capture_session.py
-```
-
-1. A Chromium browser window will open.
-2. Sign in with your authorized `@bergen.org` Google Workspace account and complete any two-factor authentication prompts.
-3. Once the document renders in the browser, return to your terminal and press **Enter**.
-4. The script will export your session to `chrome_state.json`.
-
-Deactivate the venv afterwards:
-```bash
-deactivate
-```
 ---
 
-### Step 2: Configure GitHub Repository Secrets
+### Step 2: Deploy & Configure Supabase Edge Function
 
-Go to your repository on GitHub:  
-**Settings** $\rightarrow$ **Secrets and variables** $\rightarrow$ **Actions** $\rightarrow$ **New repository secret**.
+1. Ensure the Supabase CLI is authenticated:
+   ```bash
+   npx supabase login
+   npx supabase link --project-ref blbrivnnelwgbthflmio
+   ```
+2. Deploy the `sync-absences` Edge Function:
+   ```bash
+   npx supabase functions deploy sync-absences --no-verify-jwt
+   ```
+3. Generate a strong synchronization secret:
+   ```bash
+   openssl rand -base64 64
+   ```
+4. Set required secrets in Supabase:
+   ```bash
+   npx supabase secrets set SYNC_SECRET="<YOUR_SECRET>"
+   npx supabase secrets set NOTIFICATIONS_WORKER_URL="https://bcaway-notifications.tjaynj.workers.dev"
+   ```
+
+---
+
+### Step 3: Configure GitHub Repository Secrets
+
+In GitHub, open `bcaway/backend-sync` $\rightarrow$ **Settings** $\rightarrow$ **Secrets and variables** $\rightarrow$ **Actions** $\rightarrow$ **New repository secret**.
 
 Add the following secrets:
 
 | Secret Name | Required | Description | Example / Source |
 | :--- | :---: | :--- | :--- |
-| `CHROME_STATE_JSON` | **Yes** | Entire content of `chrome_state.json` exported in Step 1. | `{"cookies": [...], "origins": [...]}` |
-| `SUPABASE_URL` | **Yes** | Your Supabase project URL. | `https://xyzcompany.supabase.co` |
-| `SYNC_SECRET` | **Yes** | Bearer secret for `/functions/v1/sync-absences`. | Configured in Supabase Edge Functions. Created with: `openssl rand -base64 64`|
-| `GOOGLE_DOC_URL` | *Optional* | Published Google Doc URL. | Defaults to BCA's published cancellation doc if omitted. |
+| `CHROME_STATE_JSON` | **Yes** | Entire raw JSON content of `chrome_state.json` from Step 1. | `{"cookies": [...], "origins": [...]}` |
+| `SUPABASE_URL` | **Yes** | Your Supabase project URL. | `https://blbrivnnelwgbthflmio.supabase.co` |
+| `SYNC_SECRET` | **Yes** | The exact bearer secret generated and saved in Supabase in Step 2. | `<YOUR_SECRET>` |
+| `GOOGLE_DOC_URL` | *Optional* | BCA Published Google Doc URL. | Defaults to official document if omitted. |
 
 ---
 
-### Step 3: Test & Verify
+### Step 4: Generate GitHub Personal Access Token (PAT)
 
-1. In GitHub, navigate to the **Actions** tab.
-2. Select **BCA Teacher Absence Sync (Off-Peak)** from the left sidebar.
-3. Click **Run workflow**:
-   * Force: `true` (forces a push to Supabase to verify connectivity).
-4. Check the workflow logs. You should see:
-   ```text
-   Parsed N absence(s) for YYYY-MM-DD
-   Submitting N record(s) to Supabase (/functions/v1/sync-absences)...
-   Supabase sync accepted (200)
+This token allows the Cloudflare Worker to trigger GitHub Actions workflows:
+
+1. Go to [GitHub Token Settings](https://github.com/settings/tokens?type=beta) (Fine-grained tokens recommended):
+   * **Token name:** `bcaway-cron-trigger`
+   * **Expiration:** As desired (e.g. 90 days or 1 year)
+   * **Repository access:** **Only select repositories** $\rightarrow$ choose `bcaway/backend-sync`
+   * **Permissions:** Under **Repository permissions**, set **Actions** to **Read and write**
+2. Generate and copy the token (`github_pat_...`).  
+   *(A classic token with `repo` or `workflow` scope also works).*
+
+---
+
+### Step 5: Deploy `backend-cron-trigger` Cloudflare Worker
+
+1. Navigate to the `backend-cron-trigger` repository:
+   ```bash
+   cd ../backend-cron-trigger
+   npm install
    ```
-5. Check your BCAway mobile app — today's absences will appear instantly via Supabase Realtime!
+2. Save the GitHub token as an encrypted secret in Cloudflare:
+   ```bash
+   npx wrangler secret put GH_DISPATCH_TOKEN
+   ```
+   *(Paste your GitHub PAT when prompted)*.
+3. Deploy the worker to Cloudflare's global edge:
+   ```bash
+   npm run deploy
+   ```
+4. Cloudflare will deploy the worker and immediately register the cron schedule:
+   ```text
+   Cron Triggers:
+     - */10 * * * *
+   ```
+
+---
+
+### Step 6: Verify End-to-End Pipeline
+
+1. **Test the Cloudflare Trigger Endpoint:**
+   Visit your deployed worker URL in a browser or run:
+   ```bash
+   curl https://backend-cron-trigger.<your-subdomain>.workers.dev/
+   ```
+   You will receive the system health report and current schedule context:
+   ```json
+   {
+     "service": "BCAway Backend Cron Trigger",
+     "status": "operational",
+     "time": { "utc": "...", "eastern": "...", "weekday": true },
+     "nextCronAction": { "type": "dispatch_offpeak", "workflow": "teacher_sync_offpeak.yml" }
+   }
+   ```
+2. **Trigger a Manual Sync Dispatch via Cloudflare:**
+   ```bash
+   curl -X POST "https://backend-cron-trigger.<your-subdomain>.workers.dev/trigger?workflow=offpeak&force=true"
+   ```
+3. **Verify in GitHub Actions:**
+   * Go to `bcaway/backend-sync` $\rightarrow$ **Actions**.
+   * You will see **BCA Teacher Absence Sync (Off-Peak)** running.
+   * View the logs to confirm:
+     ```text
+     Parsed N absence(s) for YYYY-MM-DD
+     Submitting N record(s) to Supabase (/functions/v1/sync-absences)...
+     Supabase sync accepted (200)
+     ```
+4. **Verify in Supabase & BCAway App:**
+   * Check the `teacher_absences` and `sync_metadata` tables in Supabase.
+   * Open the BCAway mobile app — absences render immediately via Supabase Realtime!
 
 ---
 
 ## 🛠 Local Development & Testing
 
-You can run and test the engine locally using a `.env` file:
+You can run the sync engine locally using a `.env` file:
 
 ```bash
 # 1. Copy sample environment file
 cp .env.example .env
 
 # 2. Fill in your credentials in .env
-# SUPABASE_URL=...
-# SYNC_SECRET=...
+# SUPABASE_URL=https://blbrivnnelwgbthflmio.supabase.co
+# SYNC_SECRET=your_sync_secret
 
 # 3. Run a single-shot test
 python3 sync_monitor.py --once
@@ -155,17 +249,26 @@ python3 sync_monitor.py --continuous --interval 10
 
 ## 📋 Parsing Rules & BCAway Normalization
 
-The parsing engine mirrors BCAway's period and teacher normalization rules:
+The parsing engine enforces strict normalization across all data:
 
-1. **Header Date Parsing:** Matches `BCA Class Cancellation List \n {Month} {Day}, {YYYY}` and converts to ISO `YYYY-MM-DD`. Falls back to current date in `America/New_York` if the header is missing.
-2. **Table Parsing:** Discards table header rows (`Teacher`, `Period`, etc.), maps Column 0 to teacher name, and Column 1 to periods impacted.
+1. **Header Date Parsing:**
+   * Looks for `BCA Class Cancellation List \n {Month} {Day}, {YYYY}`.
+   * Automatically heals split-span digit tokens (e.g. `2 026` or fragmented day digits).
+   * Normalizes to ISO `YYYY-MM-DD`.
+   * Falls back to the current date in US Eastern time if the header is absent.
+2. **Table Parsing:**
+   * Discards header rows (`Teacher`, `Period`, etc.).
+   * Column 0: Normalized Teacher Name.
+   * Column 1: Period string.
 3. **Period Normalization:**
    * `"all"` / `"all day"` $\rightarrow$ `"igs, 1, 2, 3, 4, 5, 6, 7, 8, 9"`
    * Ranges (`"1-3"`) $\rightarrow$ `"1, 2, 3"`
-   * Standalone periods (`"5"`) $\rightarrow$ `"5"`
+   * Standalone numbers (`"5"`) $\rightarrow$ `"5"`
    * `"igs"` $\rightarrow$ Always ordered first
-   * Connectors (`"through"`, `"to"`, `"&"`, `"+"`) are normalized to standard delimiters.
-4. **Deterministic Hashing:** Absences are sorted alphabetically by teacher and hashed using SHA-256. Redundant Supabase calls and duplicate push notifications are skipped if the content hasn't changed.
+   * Connectors (`"through"`, `"to"`, `"&"`, `"+"`) $\rightarrow$ parsed into individual periods.
+4. **Deterministic SHA-256 Hashing:**
+   * Absences are sorted deterministically and hashed.
+   * Redundant Supabase database updates and duplicate push notifications are skipped if the content hash has not changed.
 
 ---
 
@@ -173,9 +276,9 @@ The parsing engine mirrors BCAway's period and teacher normalization rules:
 
 ### Expired Session Cookies
 If Google invalidates the session or cookies expire:
-* The workflow will detect the Google ServiceLogin redirect, log `Authentication wall detected! Google Workspace session has expired.`, and save debug files to `.debug/`.
+* The engine detects the Google ServiceLogin redirect, logs `Authentication wall detected! Google Workspace session has expired.`, and saves debug files to `.debug/`.
 * The GitHub Actions workflow automatically uploads `debug_last_page.html` as a downloadable artifact.
-* **Fix:** Re-run `python3 capture_session.py` on your computer and update the `CHROME_STATE_JSON` GitHub secret.
+* **Fix:** Re-run `python3 capture_session.py` on your computer and update the `CHROME_STATE_JSON` GitHub repository secret.
 
-### Inspecting Artifacts
+### Inspecting Workflow Artifacts
 Whenever a workflow run fails or encounters an unexpected page structure, download the `debug-artifacts` zip from the GitHub Actions run summary page to inspect the exact HTML received by Chromium.
