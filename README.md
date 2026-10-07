@@ -34,18 +34,26 @@ flowchart TD
 
 GitHub Actions has a 5-minute minimum cron resolution and VM boot overhead (30–60s per runner). Spawning 150 separate VMs across the morning rush would quickly exhaust GitHub Actions quota.
 
-To achieve **true 1-minute resolution without hitting limits or burning runner minutes**, this workflow uses a two-tier hybrid model:
+To achieve **true 1-minute peak resolution** while keeping off-peak jobs lightweight, scheduling is split across separate workflows:
 
-### 1. Morning Peak Window (11:00 AM UTC – 1:30 PM UTC)
+### 1. Morning Peak Workflow (`teacher_sync_peak.yml`)
 * **Local School Time:** 7:00 AM – 9:30 AM EDT *(or 6:00 AM – 8:30 AM EST)*.
-* **Execution:** A single GitHub Actions runner launches at **11:00 UTC** (`cron: '0 11 * * 1-5'`) and enters an internal continuous polling loop (`--continuous --interval 60`).
-* **Interval:** Every **60 seconds** (1 minute), the engine scrapes the doc, computes the hash, and pushes changes if detected.
-* **Runtime Efficiency:** Takes advantage of the single ~150-minute job window (well within GitHub’s 360-minute per-job hard limit). Spawns exactly **1 job** instead of 150 VMs, eliminating queue delays and VM boot latency.
+* **Schedule:** Starts once at **11:00 UTC** on weekdays (`cron: '0 11 * * 1-5'`).
+* **Execution:** Runs `sync_monitor.py --continuous --interval 60`.
+* **Stop Condition:** The monitor exits when UTC reaches **13:30**.
+* **Concurrency:** Isolated to a peak-specific group so off-peak runs do not cancel it.
 
-### 2. Off-Peak Window (Any Other Time)
-* **Execution:** Runs every **10 minutes** (`cron: '*/10 * * * *'`).
-* **Smart Skip:** If the 10-minute trigger fires during the 11:00–13:30 UTC window, it evaluates `should_run=false` and immediately exits in under 2 seconds, preventing collisions with the peak worker.
-* **Interval:** Outside the peak window, it executes a single-shot check (`--once`), parses the document, and terminates in ~5 seconds.
+### 2. Off-Peak Workflow (`teacher_sync_offpeak.yml`)
+* **Schedule:** Every **10 minutes** outside the weekday peak window, and every 10 minutes all weekend.
+* **Execution:** Always runs single-shot mode (`sync_monitor.py --once`).
+* **Runtime:** Designed to finish quickly (~seconds) and terminate.
+* **Concurrency:** Uses its own off-peak group so it cannot interfere with peak continuous runs.
+
+### 3. Health Check Workflow (`teacher_sync_healthcheck.yml`)
+* Runs every 30 minutes and inspects recent scheduled workflow history.
+* Fails with an explicit alert when expected cadence is missing (e.g., no active peak run during peak, or missing recent off-peak runs).
+
+> If exact minute-by-minute timing is business-critical, use an external scheduler (serverless cron / hosted scheduler) to trigger `workflow_dispatch` and use GitHub Actions as the execution layer.
 
 ---
 
@@ -108,9 +116,8 @@ Add the following secrets:
 ### Step 3: Test & Verify
 
 1. In GitHub, navigate to the **Actions** tab.
-2. Select **BCA Teacher Absence Sync** from the left sidebar.
+2. Select **BCA Teacher Absence Sync (Off-Peak)** from the left sidebar.
 3. Click **Run workflow**:
-   * Mode: `once` (runs a single scrape cycle).
    * Force: `true` (forces a push to Supabase to verify connectivity).
 4. Check the workflow logs. You should see:
    ```text

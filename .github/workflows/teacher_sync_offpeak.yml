@@ -1,0 +1,82 @@
+name: BCA Teacher Absence Sync (Off-Peak)
+
+on:
+  schedule:
+    # Weekdays outside 11:00-13:30 UTC peak window.
+    - cron: '*/10 0-10,14-23 * * 1-5'
+    - cron: '30-59/10 13 * * 1-5'
+    # Weekends all day.
+    - cron: '*/10 * * * 0,6'
+
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Force push to Supabase (bypass hash check)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: teacher-sync-offpeak-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Sync Absences (Off-Peak)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: |
+          playwright install --with-deps chromium
+
+      - name: Restore Chrome session state from secrets
+        env:
+          CHROME_STATE_JSON: ${{ secrets.CHROME_STATE_JSON }}
+        run: |
+          if [ -z "$CHROME_STATE_JSON" ]; then
+            echo "::error::CHROME_STATE_JSON secret is empty or missing! Run capture_session.py locally and set repository secret."
+            exit 1
+          fi
+          printf '%s' "$CHROME_STATE_JSON" > chrome_state.json
+
+      - name: Run absence sync engine (single-shot)
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SYNC_SECRET: ${{ secrets.SYNC_SECRET }}
+          GOOGLE_DOC_URL: ${{ secrets.GOOGLE_DOC_URL || 'https://docs.google.com/document/d/e/2PACX-1vRkhySmwAiTtY88tcshckpV4F0vRrULccaGrYl_Sf2ubWpyyXA4l8c-KAOuMzSwFe-qyAQhLqXzVsbA/pub' }}
+        run: |
+          EXTRA_ARGS="--once"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.force }}" = "true" ]; then
+            EXTRA_ARGS="$EXTRA_ARGS --force"
+          fi
+
+          echo "Executing: python sync_monitor.py $EXTRA_ARGS"
+          python sync_monitor.py $EXTRA_ARGS
+
+      - name: Upload debug artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-artifacts-offpeak-${{ github.run_id }}
+          path: |
+            .debug/
+            debug_last_page.html
+            debug_last_response.json
+          if-no-files-found: ignore
+          retention-days: 5
