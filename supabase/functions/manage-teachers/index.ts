@@ -10,11 +10,13 @@ const supabase = createClient(
 );
 
 function secureCompare(a: string, b: string): boolean {
-  if (!a || !b) return false;
-  const aBytes = new TextEncoder().encode(a);
-  const bBytes = new TextEncoder().encode(b);
-  if (aBytes.byteLength !== bBytes.byteLength) return false;
-  return crypto.subtle.timingSafeEqual(aBytes, bBytes);
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  if (!a || !b || a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
 }
 
 function jsonResponse(
