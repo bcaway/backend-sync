@@ -123,6 +123,14 @@ function getTodayInNewYork(): string {
   }).format(new Date());
 }
 
+function secureCompare(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  const aBytes = new TextEncoder().encode(a);
+  const bBytes = new TextEncoder().encode(b);
+  if (aBytes.byteLength !== bBytes.byteLength) return false;
+  return crypto.subtle.timingSafeEqual(aBytes, bBytes);
+}
+
 function jsonResponse(
   body: Record<string, unknown>,
   status = 200,
@@ -152,27 +160,17 @@ Deno.serve(async (req) => {
 
     const isAuthorized = Boolean(
       token && (
-        token === rawSecret ||
-        token === unquotedSecret ||
-        token === serviceRoleKey
+        (rawSecret && secureCompare(token, rawSecret)) ||
+        (unquotedSecret && secureCompare(token, unquotedSecret)) ||
+        (serviceRoleKey && secureCompare(token, serviceRoleKey))
       )
     );
 
     if (!isAuthorized) {
-      console.error(
-        `Auth mismatch: received token length ${token.length}, raw secret length ${rawSecret.length}, unquoted secret length ${unquotedSecret.length}`
-      );
+      console.error("Unauthorized request received to sync-absences");
       return jsonResponse(
         {
           error: "Unauthorized",
-          debug: {
-            token_len: token.length,
-            raw_secret_len: rawSecret.length,
-            token_prefix: token.slice(0, 4),
-            secret_prefix: rawSecret.slice(0, 4),
-            token_suffix: token.slice(-4),
-            secret_suffix: rawSecret.slice(-4),
-          },
         },
         401,
       );
