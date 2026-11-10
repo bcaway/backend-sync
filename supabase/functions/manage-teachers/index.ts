@@ -31,6 +31,7 @@ function jsonResponse(
 
 type ManagePayload =
   | { action: "list" }
+  | { action: "unmapped_absences" }
   | { action: "add_teacher"; name: string; aliases?: string[] }
   | { action: "add_alias"; teacherId: string; alias: string }
   | { action: "remove_alias"; teacherId: string; alias: string }
@@ -91,6 +92,53 @@ Deno.serve(async (req) => {
           return jsonResponse({ error: error.message }, 500);
         }
         return jsonResponse({ success: true, teachers: data || [] });
+      }
+
+      case "unmapped_absences": {
+        const [absencesRes, teachersRes] = await Promise.all([
+          supabase.from("teacher_absences").select("teacher, periods_impacted"),
+          supabase.from("teachers").select("name, aliases"),
+        ]);
+
+        if (absencesRes.error) {
+          return jsonResponse({ error: absencesRes.error.message }, 500);
+        }
+
+        const teachers = teachersRes.data || [];
+        const knownKeys = new Set<string>();
+        for (const t of teachers) {
+          if (t.name) knownKeys.add(t.name.trim().toLowerCase());
+          if (Array.isArray(t.aliases)) {
+            for (const a of t.aliases) {
+              if (a) knownKeys.add(a.trim().toLowerCase());
+            }
+          }
+        }
+
+        const unmappedMap = new Map<string, { periodsImpacted: string; count: number }>();
+        for (const row of absencesRes.data || []) {
+          const raw = (row.teacher || "").trim();
+          if (!raw) continue;
+          if (!knownKeys.has(raw.toLowerCase())) {
+            const existing = unmappedMap.get(raw);
+            if (existing) {
+              existing.count += 1;
+            } else {
+              unmappedMap.set(raw, {
+                periodsImpacted: row.periods_impacted || "",
+                count: 1,
+              });
+            }
+          }
+        }
+
+        const unmapped = Array.from(unmappedMap.entries()).map(([rawTeacher, data]) => ({
+          rawTeacher,
+          periodsImpacted: data.periodsImpacted,
+          count: data.count,
+        }));
+
+        return jsonResponse({ success: true, unmapped });
       }
 
       case "add_teacher": {
