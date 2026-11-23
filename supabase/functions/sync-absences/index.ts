@@ -8,6 +8,7 @@ type Absence = {
 type SyncPayload = {
   date: string;
   absences: Absence[];
+  raw_header?: string;
 };
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
@@ -199,7 +200,8 @@ Deno.serve(async (req) => {
      * cancellation data.
      *
      * If the Sheet contains anything other than today's date,
-     * the database must be empty.
+     * the database must be empty of active absences, and
+     * sync_metadata records that today's list is NOT yet updated.
      */
     if (payload.date !== today) {
       const { error } = await supabase
@@ -219,6 +221,21 @@ Deno.serve(async (req) => {
         );
       }
 
+      // Upsert sync_metadata to record that sheet date != today
+      await supabase.from("sync_metadata").upsert({
+        id: 1,
+        doc_date: payload.date,
+        today_date: today,
+        is_updated_for_today: false,
+        last_synced_at: new Date().toISOString(),
+        absence_count: 0,
+        raw_header_text: payload.raw_header || null,
+        sync_status: "stale_date",
+      });
+
+      // Expire old absence board posts
+      await reconcileAbsenceBoard(today, new Set());
+
       return jsonResponse({
         success: true,
         changed: true,
@@ -226,6 +243,7 @@ Deno.serve(async (req) => {
         reason: "Sheet date is not today",
         sheet_date: payload.date,
         today,
+        is_updated_for_today: false,
       });
     }
 
@@ -289,15 +307,32 @@ Deno.serve(async (req) => {
     const incomingSnapshot = JSON.stringify(canonicalIncoming);
 
     /*
-     * Nothing changed. Leave Supabase completely untouched.
+     * Nothing changed. Record sync verification in sync_metadata and reconcile board.
      */
     if (currentSnapshot === incomingSnapshot) {
+      await supabase.from("sync_metadata").upsert({
+        id: 1,
+        doc_date: today,
+        today_date: today,
+        is_updated_for_today: true,
+        last_synced_at: new Date().toISOString(),
+        absence_count: canonicalIncoming.length,
+        raw_header_text: payload.raw_header || null,
+        sync_status: "updated",
+      });
+
+      await reconcileAbsenceBoard(
+        today,
+        new Set(canonicalIncoming.map((a) => a.teacher.trim().toLowerCase())),
+      );
+
       return jsonResponse({
         success: true,
         changed: false,
         cleared: false,
         date: today,
         count: canonicalIncoming.length,
+        is_updated_for_today: true,
       });
     }
 
@@ -373,6 +408,19 @@ Deno.serve(async (req) => {
      * Empty snapshot is valid. The table simply remains empty.
      */
     if (canonicalIncoming.length === 0) {
+      await supabase.from("sync_metadata").upsert({
+        id: 1,
+        doc_date: today,
+        today_date: today,
+        is_updated_for_today: true,
+        last_synced_at: new Date().toISOString(),
+        absence_count: 0,
+        raw_header_text: payload.raw_header || null,
+        sync_status: "updated",
+      });
+
+      await reconcileAbsenceBoard(today, new Set());
+
       // If there were removals, dispatch notifications
       if (absenceEvents.length > 0) {
         dispatchAbsenceNotifications(absenceEvents);
@@ -384,6 +432,7 @@ Deno.serve(async (req) => {
         cleared: true,
         date: today,
         count: 0,
+        is_updated_for_today: true,
       });
     }
 
@@ -412,6 +461,24 @@ Deno.serve(async (req) => {
       );
     }
 
+    // Upsert sync_metadata to record that today's list is active and updated
+    await supabase.from("sync_metadata").upsert({
+      id: 1,
+      doc_date: today,
+      today_date: today,
+      is_updated_for_today: true,
+      last_synced_at: syncedAt,
+      absence_count: canonicalIncoming.length,
+      raw_header_text: payload.raw_header || null,
+      sync_status: "updated",
+    });
+
+    // Reconcile matching absence board posts
+    await reconcileAbsenceBoard(
+      today,
+      new Set(canonicalIncoming.map((a) => a.teacher.trim().toLowerCase())),
+    );
+
     // Dispatch remote push notifications to Cloudflare Worker backend
     if (absenceEvents.length > 0) {
       await dispatchAbsenceNotifications(absenceEvents);
@@ -424,6 +491,7 @@ Deno.serve(async (req) => {
       date: today,
       count: canonicalIncoming.length,
       synced_at: syncedAt,
+      is_updated_for_today: true,
       notifiedEvents: absenceEvents.length,
     });
   } catch (error) {
@@ -438,6 +506,45 @@ Deno.serve(async (req) => {
     );
   }
 });
+
+async function reconcileAbsenceBoard(
+  today: string,
+  confirmedTeachers: Set<string>,
+): Promise<void> {
+  try {
+    // 1. Expire outdated active posts
+    await supabase
+      .from("absence_board_posts")
+      .update({ status: "expired", updated_at: new Date().toISOString() })
+      .lt("target_date", today)
+      .eq("status", "active");
+
+    // 2. Mark confirmed posts for today
+    if (confirmedTeachers.size > 0) {
+      const { data: todayPosts, error: fetchErr } = await supabase
+        .from("absence_board_posts")
+        .select("id, teacher_name")
+        .eq("target_date", today)
+        .eq("status", "active");
+
+      if (!fetchErr && todayPosts && todayPosts.length > 0) {
+        for (const post of todayPosts) {
+          if (confirmedTeachers.has(post.teacher_name.trim().toLowerCase())) {
+            await supabase
+              .from("absence_board_posts")
+              .update({
+                status: "official_confirmed",
+                updated_at: new Date().toISOString(),
+              })
+              .eq("id", post.id);
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.warn("Absence board reconciliation warning:", err);
+  }
+}
 
 async function dispatchAbsenceNotifications(
   events: Array<{ type: string; teacher: string; periodsImpacted?: string }>
