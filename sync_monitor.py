@@ -226,21 +226,23 @@ def get_today_in_new_york() -> str:
 # HTML Parsing & Table Extraction
 # ---------------------------------------------------------------------------
 
-def parse_absences_from_html(html: str) -> Tuple[str, List[Dict[str, str]]]:
+def parse_absences_from_html(html: str) -> Tuple[str, List[Dict[str, str]], Optional[str]]:
     """
-    Parses cancellation date and teacher absences table from the document HTML.
-    Returns (date_str, absences_list).
+    Parses cancellation date, teacher absences table, and raw header text from document HTML.
+    Returns (date_str, absences_list, raw_header_text).
     """
     soup = BeautifulSoup(html, "html.parser")
 
     # 1. Parse date by inspecting header paragraphs first (avoids span-boundary space splits)
     date_str = None
+    raw_header = None
     for elem in soup.find_all(["p", "h1", "h2", "h3", "div"]):
         elem_text = elem.get_text().strip()
         if elem_text:
             parsed = parse_header_date(elem_text)
             if parsed:
                 date_str = parsed
+                raw_header = elem_text
                 log(f"Found document date from <{elem.name}>: {date_str} ('{elem_text}')", "INFO")
                 break
 
@@ -248,17 +250,20 @@ def parse_absences_from_html(html: str) -> Tuple[str, List[Dict[str, str]]]:
     if not date_str:
         full_text = soup.get_text()
         date_str = parse_header_date(full_text)
+        if date_str:
+            raw_header = "Header matched from body text"
 
     if not date_str:
         today = get_today_in_new_york()
         log(f"Header date not found in document text; defaulting to today ET ({today})", "WARN")
         date_str = today
+        raw_header = f"Fallback to {today}"
 
     # 2. Locate tables
     tables = soup.find_all("table")
     if not tables:
         log("No <table> elements discovered in document HTML.", "WARN")
-        return date_str, []
+        return date_str, [], raw_header
 
     # Choose candidate table (either table with Teacher/Period header or the first non-empty table)
     target_table = None
@@ -298,7 +303,7 @@ def parse_absences_from_html(html: str) -> Tuple[str, List[Dict[str, str]]]:
 
     # Sort alphabetically by teacher for deterministic JSON snapshot hashing
     raw_absences.sort(key=lambda a: a["teacher"].lower())
-    return date_str, raw_absences
+    return date_str, raw_absences, raw_header
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +434,7 @@ def push_to_supabase(
     sync_secret: str,
     date_str: str,
     absences: List[Dict[str, str]],
+    raw_header: Optional[str] = None,
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     Submits normalized absences payload to Supabase Edge Function 'sync-absences'.
@@ -448,6 +454,7 @@ def push_to_supabase(
     payload = {
         "date": date_str,
         "absences": absences,
+        "raw_header": raw_header,
     }
 
     log(f"Submitting {len(absences)} record(s) for {date_str} to Supabase ({endpoint})...")
@@ -498,7 +505,7 @@ class SyncOrchestrator:
         if not html:
             return False
 
-        date_str, absences = parse_absences_from_html(html)
+        date_str, absences, raw_header = parse_absences_from_html(html)
         current_hash = compute_snapshot_hash(date_str, absences)
 
         log(f"Parsed {len(absences)} absence(s) for {date_str} (Hash: {current_hash[:12]}...)")
@@ -517,6 +524,7 @@ class SyncOrchestrator:
             self.sync_secret,
             date_str,
             absences,
+            raw_header,
         )
 
         if success:
